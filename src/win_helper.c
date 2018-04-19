@@ -56,6 +56,9 @@
 extern bool validate_Device_Struct(versionBlock);
 
 int get_Windows_SMART_IO_Support(tDevice *device);
+#if WINVER >= SEA_WIN32_WINNT_WINBLUE //Win 8.1 adds this capability
+int get_Windows_FWDL_IO_Support_Win8_1(tDevice *device);
+#endif
 #if WINVER >= SEA_WIN32_WINNT_WIN10
 int get_Windows_FWDL_IO_Support(tDevice *device);
 bool is_Firmware_Download_Command_Compatible_With_Win_API(ScsiIoCtx *scsiIoCtx);//TODO: add nvme support...may not need an NVMe version since it's the only way to update code on NVMe
@@ -464,6 +467,12 @@ int get_Device(const char *filename, tDevice *device )
                                                   FALSE);
                             if (win_ret > 0)
                             {
+                                if (is_Windows_8_One_Or_Higher())
+                                {
+                                    printf("Is 8.1 or higher\n");
+                                }
+
+								get_Windows_FWDL_IO_Support_Win81(device);
 #if WINVER >= SEA_WIN32_WINNT_WIN10
 								get_Windows_FWDL_IO_Support(device);
 #endif
@@ -523,6 +532,7 @@ int get_Device(const char *filename, tDevice *device )
                                 }								
                                 else if (device_desc->BusType == BusTypeNvme)
                                 {
+									get_Windows_FWDL_IO_Support_Win81(device);
 #if WINVER >= SEA_WIN32_WINNT_WIN10 && !defined(DISABLE_NVME_PASSTHROUGH)
                                     device->drive_info.drive_type = NVME_DRIVE;
                                     device->drive_info.interface_type = NVME_INTERFACE;
@@ -2567,6 +2577,204 @@ int send_IDE_Pass_Through_IO(ScsiIoCtx *scsiIoCtx)
     safe_Free(doubleBufferedIO);
     return ret;
 }
+#if WINVER >= SEA_WIN32_WINNT_WINBLUE //Win 8.1 adds this capability, but recent versions of the Windows 8.1 API removed all references to it!
+//Check if things are defined or not to do this! If not defined, but using 8.1 API or forward, define it!
+
+#if !defined (IOCTL_SCSI_MINIPORT_FIRMWARE)
+//Defining the types we need to use this IOCTL. These come from the MS API code in Windows 10 API, but online docs say it was first available in Win 8.1
+//https://docs.microsoft.com/en-us/windows-hardware/drivers/storage/upgrading-firmware-for-an-nvme-device
+#define IOCTL_SCSI_MINIPORT_FIRMWARE          ((FILE_DEVICE_SCSI << 16) + 0x0780)
+
+#define IOCTL_MINIPORT_SIGNATURE_FIRMWARE           "FIRMWARE"
+
+#define FIRMWARE_REQUEST_BLOCK_STRUCTURE_VERSION            0x1
+
+//
+// Data structure and definitions related to IOCTL_SCSI_MINIPORT_FIRMWARE
+//
+
+#define FIRMWARE_FUNCTION_GET_INFO                          0x01
+#define FIRMWARE_FUNCTION_DOWNLOAD                          0x02
+#define FIRMWARE_FUNCTION_ACTIVATE                          0x03
+
+//
+// FIRMWARE IOCTL status
+//
+#define FIRMWARE_STATUS_SUCCESS                             0x0
+#define FIRMWARE_STATUS_ERROR                               0x1
+#define FIRMWARE_STATUS_ILLEGAL_REQUEST                     0x2
+#define FIRMWARE_STATUS_INVALID_PARAMETER                   0x3
+#define FIRMWARE_STATUS_INPUT_BUFFER_TOO_BIG                0x4
+#define FIRMWARE_STATUS_OUTPUT_BUFFER_TOO_SMALL             0x5
+#define FIRMWARE_STATUS_INVALID_SLOT                        0x6
+#define FIRMWARE_STATUS_INVALID_IMAGE                       0x7
+#define FIRMWARE_STATUS_CONTROLLER_ERROR                    0x10
+#define FIRMWARE_STATUS_POWER_CYCLE_REQUIRED                0x20
+#define FIRMWARE_STATUS_DEVICE_ERROR                        0x40
+#define FIRMWARE_STATUS_INTERFACE_CRC_ERROR                 0x80
+#define FIRMWARE_STATUS_UNCORRECTABLE_DATA_ERROR            0x81
+#define FIRMWARE_STATUS_MEDIA_CHANGE                        0x82
+#define FIRMWARE_STATUS_ID_NOT_FOUND                        0x83
+#define FIRMWARE_STATUS_MEDIA_CHANGE_REQUEST                0x84
+#define FIRMWARE_STATUS_COMMAND_ABORT                       0x85
+#define FIRMWARE_STATUS_END_OF_MEDIA                        0x86
+#define FIRMWARE_STATUS_ILLEGAL_LENGTH                      0x87
+
+//
+// The request is for Controller if this flag is set. Otherwise, it's for Device/Unit.
+//
+#define FIRMWARE_REQUEST_FLAG_CONTROLLER                    0x00000001
+
+//
+// Indicate that current FW image segment is the last one.
+//
+#define FIRMWARE_REQUEST_FLAG_LAST_SEGMENT                  0x00000002
+
+//
+// Indicate that current FW image segment is the first one.
+//
+#define FIRMWARE_REQUEST_FLAG_FIRST_SEGMENT                 0x00000004
+
+//
+// Indicate that the existing firmware in slot should be activated. 
+// This flag is only valid for fimrware_activate request. It's ignored for other requests.
+//
+#define FIRMWARE_REQUEST_FLAG_SWITCH_TO_EXISTING_FIRMWARE   0x80000000
+
+#pragma warning(push)
+#pragma warning(disable:4200) // nonstandard extension used : zero-sized array in struct/union
+typedef struct _STORAGE_FIRMWARE_SLOT_INFO {
+
+	UCHAR   SlotNumber;
+	BOOLEAN ReadOnly;
+	UCHAR   Reserved[6];
+
+	union {
+		UCHAR     Info[8];
+		ULONGLONG AsUlonglong;
+	} Revision;
+
+} STORAGE_FIRMWARE_SLOT_INFO, *PSTORAGE_FIRMWARE_SLOT_INFO;
+
+
+typedef struct _STORAGE_FIRMWARE_INFO {
+
+	ULONG   Version;        // STORAGE_FIRMWARE_INFO_STRUCTURE_VERSION
+	ULONG   Size;           // sizeof(STORAGE_FIRMWARE_INFO)
+
+	BOOLEAN UpgradeSupport;
+	UCHAR   SlotCount;
+	UCHAR   ActiveSlot;
+	UCHAR   PendingActivateSlot;
+
+	ULONG   Reserved;
+
+	STORAGE_FIRMWARE_SLOT_INFO Slot[0];
+
+} STORAGE_FIRMWARE_INFO, *PSTORAGE_FIRMWARE_INFO;
+
+typedef struct _FIRMWARE_REQUEST_BLOCK {
+	ULONG   Version;            // FIRMWARE_REQUEST_BLOCK_STRUCTURE_VERSION
+	ULONG   Size;               // Size of the data structure.
+	ULONG   Function;           // Function code
+	ULONG   Flags;
+
+	ULONG   DataBufferOffset;   // the offset is from the beginning of buffer. e.g. from beginning of SRB_IO_CONTROL. The value should be multiple of sizeof(PVOID); Value 0 means that there is no data buffer.
+	ULONG   DataBufferLength;   // length of the buffer
+} FIRMWARE_REQUEST_BLOCK, *PFIRMWARE_REQUEST_BLOCK;
+#pragma warning(pop)
+
+//
+// Parameter for FIRMWARE_FUNCTION_ACTIVATE
+// Input buffer should contain SRB_IO_CONTROL and FIRMWARE_REQUEST_BLOCK data structures.
+// Field "DataBufferOffset" of FIRMWARE_REQUEST_BLOCK points to input data buffer that contains STORAGE_FIRMWARE_ACTIVATE.
+//
+#define STORAGE_FIRMWARE_ACTIVATE_STRUCTURE_VERSION         0x1
+
+typedef struct _STORAGE_FIRMWARE_ACTIVATE {
+
+	ULONG   Version;
+	ULONG   Size;
+
+	UCHAR   SlotToActivate;
+	UCHAR   Reserved0[3];
+
+} STORAGE_FIRMWARE_ACTIVATE, *PSTORAGE_FIRMWARE_ACTIVATE;
+
+#define STORAGE_FIRMWARE_DOWNLOAD_STRUCTURE_VERSION         0x1
+typedef struct _STORAGE_FIRMWARE_DOWNLOAD {
+
+	ULONG       Version;            // STORAGE_FIRMWARE_DOWNLOAD_STRUCTURE_VERSION
+	ULONG       Size;               // sizeof(STORAGE_FIRMWARE_DOWNLOAD)
+
+	ULONGLONG   Offset;             // image file offset, should be aligned to value of "ImagePayloadAlignment" from STORAGE_FIRMWARE_INFO.
+	ULONGLONG   BufferSize;         // should be multiple of value of "ImagePayloadAlignment" from STORAGE_FIRMWARE_INFO
+
+	UCHAR       ImageBuffer[0];     // firmware image file. 
+
+} STORAGE_FIRMWARE_DOWNLOAD, *PSTORAGE_FIRMWARE_DOWNLOAD;
+
+#endif
+
+int get_Windows_FWDL_IO_Support_Win8_1(tDevice *device)
+{
+	int ret = NOT_SUPPORTED;
+	uint32_t bufferLength = 4096;
+	uint8_t buffer[4096] = { 0 };
+	PSRB_IO_CONTROL         srbControl;
+	PFIRMWARE_REQUEST_BLOCK firmwareRequest;
+	PSTORAGE_FIRMWARE_INFO  firmwareInfo;
+	srbControl = (PSRB_IO_CONTROL)buffer;
+	firmwareRequest = (PFIRMWARE_REQUEST_BLOCK)(srbControl + 1);
+	ULONG firmwareInfoOffset = ((sizeof(SRB_IO_CONTROL) + sizeof(FIRMWARE_REQUEST_BLOCK) - 1) / sizeof(PVOID) + 1) * sizeof(PVOID);
+
+	//
+	// Setup the SRB control with the firmware ioctl control info
+	//
+	srbControl->HeaderLength = sizeof(SRB_IO_CONTROL);
+	srbControl->ControlCode = IOCTL_SCSI_MINIPORT_FIRMWARE;
+	RtlMoveMemory(srbControl->Signature, IOCTL_MINIPORT_SIGNATURE_FIRMWARE, 8);
+	srbControl->Timeout = 30;
+	srbControl->Length = bufferLength - sizeof(SRB_IO_CONTROL);
+	//
+	// Set firmware request fields for FIRMWARE_FUNCTION_GET_INFO. This request is to the controller so
+	// FIRMWARE_REQUEST_FLAG_CONTROLLER is set in the flags
+	//
+	firmwareRequest->Version = FIRMWARE_REQUEST_BLOCK_STRUCTURE_VERSION;
+	firmwareRequest->Size = sizeof(FIRMWARE_REQUEST_BLOCK);
+	firmwareRequest->Function = FIRMWARE_FUNCTION_GET_INFO;
+	firmwareRequest->Flags = FIRMWARE_REQUEST_FLAG_CONTROLLER;
+	firmwareRequest->DataBufferOffset = firmwareInfoOffset;
+	firmwareRequest->DataBufferLength = bufferLength - firmwareInfoOffset;
+
+	//
+	// Send the request to get the device firmware info
+	//
+	ULONG returnedLength = 0;
+	BOOL result = DeviceIoControl(device->os_info.fd,
+		IOCTL_SCSI_MINIPORT,
+		buffer,
+		bufferLength,
+		buffer,
+		bufferLength,
+		&returnedLength,
+		NULL
+	);
+
+	if (result)
+	{
+		firmwareInfo = (PSTORAGE_FIRMWARE_INFO)((PUCHAR)srbControl + firmwareRequest->DataBufferOffset);
+		ret = SUCCESS;
+	}
+	else
+	{
+		DWORD lastError = GetLastError();
+		ret = FAILURE;
+	}
+	return SUCCESS;
+}
+#endif
+
 #if WINVER >= SEA_WIN32_WINNT_WIN10
 bool is_Firmware_Download_Command_Compatible_With_Win_API(ScsiIoCtx *scsiIoCtx)//TODO: add nvme support
 {
@@ -4480,7 +4688,7 @@ int send_Win_NVMe_Get_Features_Cmd(nvmeCmdCtx *nvmeIoCtx)
 
     return returnValue;
 }
-
+//Win8 nvme update: https://docs.microsoft.com/en-us/windows-hardware/drivers/storage/upgrading-firmware-for-an-nvme-device
 int send_Win_NVMe_Firmware_Activate_Command(nvmeCmdCtx *nvmeIoCtx)
 {
     int ret = OS_PASSTHROUGH_FAILURE;
@@ -4548,6 +4756,7 @@ int send_Win_NVMe_Firmware_Activate_Command(nvmeCmdCtx *nvmeIoCtx)
     }
     return ret;
 }
+//Win8 nvme update: https://docs.microsoft.com/en-us/windows-hardware/drivers/storage/upgrading-firmware-for-an-nvme-device
 int send_Win_NVMe_Firmware_Image_Download_Command(nvmeCmdCtx *nvmeIoCtx)
 {
     int ret = OS_PASSTHROUGH_FAILURE;

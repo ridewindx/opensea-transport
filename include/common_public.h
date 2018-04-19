@@ -926,12 +926,15 @@ extern "C"
             bool smartSupported;//B0 command can be sent through this IO
             uint8_t deviceBitmap;//This specifies which channel the drive is on (PATA)...might need this for sending this IO on some legacy systems. See bIDEDeviceMap here https://msdn.microsoft.com/en-us/library/windows/hardware/ff554977(v=vs.85).aspx
         }winSMARTCmdSupport;
-#if WINVER >= SEA_WIN32_WINNT_WIN10
+#if WINVER >= SEA_WIN32_WINNT_WINBLUE
 		struct {
 			bool fwdlIOSupported;
+			bool win8_1SupportOnly;//for Windows 8.1, we can't get an alignement or max transfer size, and we use a different IOCTL to perform the download. This is to support those older systems. Other flags below may not be usefil or supported.
 			uint32_t payloadAlignment; //From MSDN: The alignment of the image payload, in number of bytes. The maximum is PAGE_SIZE. The transfer size is a mutliple of this size. Some protocols require at least sector size. When this value is set to 0, this means that this value is invalid.
 			uint32_t maxXferSize; //From MSDN: The image payload maximum size, this is used for a single command
+			bool isFirstSegmentOfDownload;//new in newer Win10 API. Only to be used during a download. Should find a better home for this.
 			bool isLastSegmentOfDownload;//This should be set only when we are issuing a download command...We should find a better place for this.
+			bool activateExistingCode;//switching between already downloaded firmwares? This probably needs a better home
 			//TODO: expand this struct if we need other data when we check for firmware download support on a device.
 		}fwdlIOsupport;
 #endif
