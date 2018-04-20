@@ -2920,11 +2920,16 @@ int windows_Firmware_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
         memset(&downloadActivate, 0, sizeof(STORAGE_HW_FIRMWARE_ACTIVATE));
         downloadActivate.Version = sizeof(STORAGE_HW_FIRMWARE_ACTIVATE);
         downloadActivate.Size = sizeof(STORAGE_HW_FIRMWARE_ACTIVATE);
-        //downloadActivate.Flags |= STORAGE_HW_FIRMWARE_REQUEST_FLAG_SWITCH_TO_EXISTING_FIRMWARE;
         if (scsiIoCtx && !scsiIoCtx->pAtaCmdOpts)
         {
             downloadActivate.Slot = scsiIoCtx->cdb[2];//Set the slot number to the buffer ID number...This is the closest this translates.
         }
+		//check to see if we're activating fw in an existing slot...mostly here for NVMe if it were to follow a SCSI path down
+		//TODO: make sure this isn't bad to set when it's ATA or SCSI interface!
+		if (scsiIoCtx->device->os_info.fwdlIOsupport.activateExistingCode)
+		{
+			downloadActivate.Flags |= STORAGE_HW_FIRMWARE_REQUEST_FLAG_SWITCH_TO_EXISTING_FIRMWARE;
+		}
 		if (scsiIoCtx->device->drive_info.interface_type == NVME_INTERFACE)
 		{
 			//if we are on NVMe, but the command comes to here, then someone forced SCSI mode, so let's set this flag correctly
@@ -3080,6 +3085,12 @@ int windows_Firmware_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
 		memset(downloadIO, 0, downloadStructureSize);
 		downloadIO->Version = sizeof(STORAGE_HW_FIRMWARE_DOWNLOAD);
 		downloadIO->Size = downloadStructureSize;
+#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_16299
+		if (scsiIoCtx->device->os_info.fwdlIOsupport.isFirstSegmentOfDownload)
+		{
+			downloadIO->Flags |= STORAGE_HW_FIRMWARE_REQUEST_FLAG_FIRST_SEGMENT;
+		}
+#endif
 #if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_15063
 		if (scsiIoCtx->device->os_info.fwdlIOsupport.isLastSegmentOfDownload)
 		{
@@ -4699,7 +4710,7 @@ int send_Win_NVMe_Firmware_Activate_Command(nvmeCmdCtx *nvmeIoCtx)
     downloadActivate.Size = sizeof(STORAGE_HW_FIRMWARE_ACTIVATE);
     uint8_t activateAction = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 5, 3);
 	downloadActivate.Flags |= STORAGE_HW_FIRMWARE_REQUEST_FLAG_CONTROLLER;//this command must go to the controller, not the namespace
-    if (activateAction == 0x2 || activateAction == 0x03)//check the activate action
+    if (activateAction == 0x2 || activateAction == 0x03 || nvmeIoCtx->device->os_info.fwdlIOsupport.activateExistingCode)//check the activate action
     {
         //Activate actions 2, & 3 sound like the closest match to this flag. Each of these requests switching to the a firmware already on the drive.
 		//Activate action 0 & 1 say to replace a firmware image in a specified slot (and to or not to activate).
@@ -4772,6 +4783,12 @@ int send_Win_NVMe_Firmware_Image_Download_Command(nvmeCmdCtx *nvmeIoCtx)
     downloadIO->Version = sizeof(STORAGE_HW_FIRMWARE_DOWNLOAD);
     downloadIO->Size = downloadStructureSize;
 	downloadIO->Flags |= STORAGE_HW_FIRMWARE_REQUEST_FLAG_CONTROLLER;
+#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_16299
+	if (nvmeIoCtx->device->os_info.fwdlIOsupport.isFirstSegmentOfDownload)
+	{
+		downloadIO->Flags |= STORAGE_HW_FIRMWARE_REQUEST_FLAG_FIRST_SEGMENT;
+	}
+#endif
 #if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_15063
     if (nvmeIoCtx->device->os_info.fwdlIOsupport.isLastSegmentOfDownload)
     {
