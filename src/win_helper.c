@@ -467,14 +467,14 @@ int get_Device(const char *filename, tDevice *device )
                                                   FALSE);
                             if (win_ret > 0)
                             {
-                                if (is_Windows_8_One_Or_Higher())
-                                {
-                                    printf("Is 8.1 or higher\n");
-                                }
-
-								get_Windows_FWDL_IO_Support_Win81(device);
 #if WINVER >= SEA_WIN32_WINNT_WIN10
 								get_Windows_FWDL_IO_Support(device);
+#elif WINVER >= SEA_WIN32_WINNT_WINBLUE
+								//TODO: Should we do this check always with Win10 FWDL check? Right now I don't think it's necessary to do. Having this only for 8.1 API should be ok - TJE
+								if (is_Windows_8_One_Or_Higher())
+								{
+									get_Windows_FWDL_IO_Support_Win8_1(device);
+								}
 #endif
                                 //#if defined (_DEBUG)
                                 //printf("Drive BusType: ");
@@ -532,7 +532,6 @@ int get_Device(const char *filename, tDevice *device )
                                 }								
                                 else if (device_desc->BusType == BusTypeNvme)
                                 {
-									get_Windows_FWDL_IO_Support_Win81(device);
 #if WINVER >= SEA_WIN32_WINNT_WIN10 && !defined(DISABLE_NVME_PASSTHROUGH)
                                     device->drive_info.drive_type = NVME_DRIVE;
                                     device->drive_info.interface_type = NVME_INTERFACE;

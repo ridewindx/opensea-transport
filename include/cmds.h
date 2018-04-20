@@ -147,12 +147,13 @@ extern "C"
     //!   \param xferLen - transfer length
     //!   \param ptrData - pointer to the data buffer that will do the transfer
     //!   \param slotNumber - set to the slot number (NVMe) or buffer ID (SCSI) that you want to set. If unsure, set this to zero. Ignored on ATA drives. Only used for activate on NVMe drives.
+	//!   \param activateExistingFirmware - set to true if you are on NVMe and switching (activating) to a slot that already has firmware in it. This helps set mode and flags correctly
     //!   
     //  Exit:
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int firmware_Download_Command(tDevice *device, eDownloadMode dlMode, bool useDMA, uint32_t offset, uint32_t xferLen, uint8_t *ptrData, uint8_t slotNumber);
+    OPENSEA_TRANSPORT_API int firmware_Download_Command(tDevice *device, eDownloadMode dlMode, bool useDMA, uint32_t offset, uint32_t xferLen, uint8_t *ptrData, uint8_t slotNumber, bool activateExistingFirmware);
 
     //-----------------------------------------------------------------------------
     //
@@ -163,12 +164,13 @@ extern "C"
     //!   \param device - pointer to the device structure
     //!   \param useDMA - use DMA mode for download. (This is only for ATA drives and will only work if the drive supports download DMA)
     //!   \param slotNumber - set to the slot number (NVMe) or buffer ID (SCSI) that you want to set. If unsure, set this to zero. Ignored on ATA drives.
+	//!   \param activateExistingFirmware - set to true if you are on NVMe and switching to a slot that already has firmware in it. This helps set mode and flags correctly
     //!   
     //  Exit:
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int firmware_Download_Activate(tDevice *device, bool useDMA, uint8_t slotNumber);
+    OPENSEA_TRANSPORT_API int firmware_Download_Activate(tDevice *device, bool useDMA, uint8_t slotNumber, bool activateExistingFirmware);
 
     typedef enum _eSecurityProtocols
     {

@@ -293,7 +293,7 @@ int fill_Drive_Info_Data(tDevice *device)
 	return status;
 }
 
-int firmware_Download_Command(tDevice *device, eDownloadMode dlMode, bool useDMA, uint32_t offset, uint32_t xferLen, uint8_t *ptrData, uint8_t slotNumber)
+int firmware_Download_Command(tDevice *device, eDownloadMode dlMode, bool useDMA, uint32_t offset, uint32_t xferLen, uint8_t *ptrData, uint8_t slotNumber, bool activateExistingFirmware)
 {
     int ret = UNKNOWN;
 #ifdef _DEBUG
@@ -334,7 +334,24 @@ int firmware_Download_Command(tDevice *device, eDownloadMode dlMode, bool useDMA
         switch (dlMode)
         {
         case DL_FW_ACTIVATE:
-            ret = nvme_Firmware_Commit(device, NVME_CA_REPLACE_ACTIVITE_ON_RST, slotNumber);
+			if (activateExistingFirmware)
+			{
+#if defined (_WIN32) && defined(WINVER)
+#if WINVER >= SEA_WIN32_WINNT_WIN10
+				device->os_info.fwdlIOsupport.activateExistingCode = true;
+#endif
+#endif
+				ret = nvme_Firmware_Commit(device, NVME_CA_ACTIVITE_ON_RST, slotNumber);//or use flag NVME_CA_ACTIVITE_IMMEDIATE???
+#if defined (_WIN32) && defined(WINVER)
+#if WINVER >= SEA_WIN32_WINNT_WIN10
+				device->os_info.fwdlIOsupport.activateExistingCode = false;
+#endif
+#endif
+			}
+			else
+			{
+				ret = nvme_Firmware_Commit(device, NVME_CA_REPLACE_ACTIVITE_ON_RST, slotNumber);
+			}
             break;
         case DL_FW_DEFERRED:
             ret = nvme_Firmware_Image_Dl(device, offset, xferLen, ptrData);
@@ -358,6 +375,14 @@ int firmware_Download_Command(tDevice *device, eDownloadMode dlMode, bool useDMA
         {
         case DL_FW_ACTIVATE:
             scsiDLMode = SCSI_WB_ACTIVATE_DEFERRED_MICROCODE;
+#if defined (_WIN32) && defined(WINVER)
+#if WINVER >= SEA_WIN32_WINNT_WIN10
+			if (activateExistingFirmware)
+			{
+				device->os_info.fwdlIOsupport.activateExistingCode = true;
+			}
+#endif
+#endif
             break;
         case DL_FW_FULL:
             scsiDLMode = SCSI_WB_DL_MICROCODE_SAVE_ACTIVATE;
@@ -378,6 +403,11 @@ int firmware_Download_Command(tDevice *device, eDownloadMode dlMode, bool useDMA
             return BAD_PARAMETER;
         }
         ret = scsi_Write_Buffer(device, scsiDLMode, 0, slotNumber, offset, xferLen, ptrData);
+#if defined (_WIN32) && defined(WINVER)
+#if WINVER >= SEA_WIN32_WINNT_WIN10
+		device->os_info.fwdlIOsupport.activateExistingCode = false;
+#endif
+#endif
     }
         break;
     default:
@@ -390,9 +420,9 @@ int firmware_Download_Command(tDevice *device, eDownloadMode dlMode, bool useDMA
     return ret;
 }
 
-int firmware_Download_Activate(tDevice *device, bool useDMA, uint8_t slotNumber)
+int firmware_Download_Activate(tDevice *device, bool useDMA, uint8_t slotNumber, bool activateExistingFirmware)
 {
-    return firmware_Download_Command(device, DL_FW_ACTIVATE, useDMA, 0, 0, NULL, slotNumber);
+    return firmware_Download_Command(device, DL_FW_ACTIVATE, useDMA, 0, 0, NULL, slotNumber, activateExistingFirmware);
 }
 
 int security_Send(tDevice *device, bool useDMA, uint8_t securityProtocol, uint16_t securityProtocolSpecific, uint8_t *ptrData, uint32_t dataSize)
