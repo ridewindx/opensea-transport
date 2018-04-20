@@ -2764,6 +2764,11 @@ int get_Windows_FWDL_IO_Support_Win8_1(tDevice *device)
 	if (result)
 	{
 		firmwareInfo = (PSTORAGE_FIRMWARE_INFO)((PUCHAR)srbControl + firmwareRequest->DataBufferOffset);
+		device->os_info.fwdlIOsupport.fwdlIOSupported = firmwareInfo->UpgradeSupport;
+		if (device->os_info.fwdlIOsupport.fwdlIOSupported)
+		{
+			device->os_info.fwdlIOsupport.win8_1SupportOnly;
+		}
 		ret = SUCCESS;
 	}
 	else
