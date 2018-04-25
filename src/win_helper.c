@@ -468,7 +468,10 @@ int get_Device(const char *filename, tDevice *device )
                             if (win_ret > 0)
                             {
 #if WINVER >= SEA_WIN32_WINNT_WIN10
-								get_Windows_FWDL_IO_Support(device);
+								if (is_Windows_10_Or_Higher())
+								{
+									get_Windows_FWDL_IO_Support(device);
+								}
 #elif WINVER >= SEA_WIN32_WINNT_WINBLUE
 								//TODO: Should we do this check always with Win10 FWDL check? Right now I don't think it's necessary to do. Having this only for 8.1 API should be ok - TJE
 								if (is_Windows_8_One_Or_Higher())
@@ -537,8 +540,8 @@ int get_Device(const char *filename, tDevice *device )
                                     device->drive_info.interface_type = NVME_INTERFACE;
                                     set_Namespace_ID_For_Device(device);
 #else									
-									device->drive_info.drive_type = SCSI_DRIVE;
-									device->drive_info.interface_type = SCSI_INTERFACE;
+									device->drive_info.drive_type = SCSI_DRIVE;//leave as a SCSI drive and let SCSI translation take place
+									device->drive_info.interface_type = NVME_INTERFACE;//Leave the interface alone. This will be OK. - TJE
                                     device->os_info.ioType = WIN_IOCTL_SCSI_PASSTHROUGH;
 									//Because out of box driver fails if STORAGE_BLOCK flag is used. 
 									device->os_info.srbtype = SRB_TYPE_SCSI_REQUEST_BLOCK;
@@ -2714,7 +2717,7 @@ typedef struct _STORAGE_FIRMWARE_DOWNLOAD {
 } STORAGE_FIRMWARE_DOWNLOAD, *PSTORAGE_FIRMWARE_DOWNLOAD;
 
 #endif
-
+//This is likely only implemented for NVMe devices. Use Win10 API for SAS and SATA
 int get_Windows_FWDL_IO_Support_Win8_1(tDevice *device)
 {
 	int ret = NOT_SUPPORTED;
@@ -2742,7 +2745,10 @@ int get_Windows_FWDL_IO_Support_Win8_1(tDevice *device)
 	firmwareRequest->Version = FIRMWARE_REQUEST_BLOCK_STRUCTURE_VERSION;
 	firmwareRequest->Size = sizeof(FIRMWARE_REQUEST_BLOCK);
 	firmwareRequest->Function = FIRMWARE_FUNCTION_GET_INFO;
-	firmwareRequest->Flags = FIRMWARE_REQUEST_FLAG_CONTROLLER;
+	if (device->drive_info.interface_type == NVME_INTERFACE)
+	{
+		firmwareRequest->Flags = FIRMWARE_REQUEST_FLAG_CONTROLLER;
+	}
 	firmwareRequest->DataBufferOffset = firmwareInfoOffset;
 	firmwareRequest->DataBufferLength = bufferLength - firmwareInfoOffset;
 
@@ -2776,6 +2782,762 @@ int get_Windows_FWDL_IO_Support_Win8_1(tDevice *device)
 		ret = FAILURE;
 	}
 	return SUCCESS;
+}
+
+bool is_Activate_Command_8_1(ScsiIoCtx *scsiIoCtx)
+{
+	bool isActivate = false;
+	if (scsiIoCtx->pAtaCmdOpts && (scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE || scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE_DMA))
+	{
+		//check the subcommand (feature)
+		if (scsiIoCtx->pAtaCmdOpts->tfr.ErrorFeature == 0x0F)
+		{
+			isActivate = true;
+		}
+	}
+	else if (scsiIoCtx->cdb[OPERATION_CODE] == WRITE_BUFFER_CMD)
+	{
+		//it's a write buffer command, so we need to also check the mode.
+		uint8_t wbMode = M_GETBITRANGE(scsiIoCtx->cdb[1], 4, 0);
+		switch (wbMode)
+		{
+		case 0x0F:
+			isActivate = true;
+			break;
+		default:
+			break;
+		}
+	}
+	return isActivate;
+}
+
+bool is_Firmware_Download_Command_Compatible_With_Win_API_8_1(ScsiIoCtx *scsiIoCtx)//TODO: add nvme support
+{
+	if (!scsiIoCtx->device->os_info.fwdlIOsupport.fwdlIOSupported)
+	{
+		//OS doesn't support this IO on this device, so just say no!
+		return false;
+	}
+	//If we are trying to send an ATA command, then only use the API if it's IDE. 
+	//SCSI and RAID interfaces depend on the SATL to translate it correctly, but that is not checked by windows and is not possible since nothing responds to the report supported operation codes command
+	//A future TODO will be to have either a lookup table or additional check somewhere to send the report supported operation codes command, but this is good enough for now, since it's unlikely a SATL will implement that...
+	if (scsiIoCtx && scsiIoCtx->pAtaCmdOpts && scsiIoCtx->device->drive_info.interface_type == IDE_INTERFACE)
+	{
+		//We're sending an ATA passthrough command, and the OS says the io is supported, so it SHOULD work. - TJE
+		if (scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE || scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE_DMA)
+		{
+			if (scsiIoCtx->pAtaCmdOpts->tfr.ErrorFeature == 0x0E)
+			{
+				//We know it's a download command, now we need to make sure it's a multiple of the Windows alignment requirement and that it isn't larger than the maximum allowed
+				uint16_t transferSizeSectors = M_BytesTo2ByteValue(scsiIoCtx->pAtaCmdOpts->tfr.LbaLow, scsiIoCtx->pAtaCmdOpts->tfr.SectorCount);
+				if ((uint32_t)(transferSizeSectors * LEGACY_DRIVE_SEC_SIZE) < UINT32_C(65535) && ((uint32_t)(transferSizeSectors * LEGACY_DRIVE_SEC_SIZE) % UINT32_C(512) == 0))//hard coded lengths are guesses based off of what we get in Win10 API
+				{
+					return true;
+				}
+			}
+			else if (scsiIoCtx->pAtaCmdOpts->tfr.ErrorFeature == 0x0F)
+			{
+				return true;
+			}
+		}
+	}
+	else if (scsiIoCtx)//sending a SCSI command
+	{
+		//TODO? Should we check that this is a SCSI Drive? Right now we'll just attempt the download and let the drive/SATL handle translation
+		//check that it's a write buffer command for a firmware download & it's a deferred download command since that is all that is supported
+		if (scsiIoCtx->cdb[OPERATION_CODE] == WRITE_BUFFER_CMD)
+		{
+			uint8_t wbMode = M_GETBITRANGE(scsiIoCtx->cdb[1], 4, 0);
+			uint32_t transferLength = M_BytesTo4ByteValue(0, scsiIoCtx->cdb[6], scsiIoCtx->cdb[7], scsiIoCtx->cdb[8]);
+			switch (wbMode)
+			{
+			case SCSI_WB_DL_MICROCODE_OFFSETS_SAVE_DEFER:
+				if (transferLength < UINT32_C(65535) && (transferLength % UINT32_C(4096) == 0))//hard coded lengths are guesses based off of what we get in Win10 API
+				{
+					return true;
+				}
+				break;
+			case SCSI_WB_ACTIVATE_DEFERRED_MICROCODE:
+				return true;
+				break;
+			default:
+				break;
+			}
+		}
+	}
+	//TODO: add checking NVMe CTX for firmware download command
+	return false;
+}
+
+int windows_Firmware_Download_IO_SCSI_8_1(ScsiIoCtx *scsiIoCtx)
+{
+	int ret = OS_PASSTHROUGH_FAILURE;
+	if (!scsiIoCtx)
+	{
+		return BAD_PARAMETER;
+	}
+	if (is_Activate_Command_8_1(scsiIoCtx))
+	{
+		//send the activate IOCTL
+		ULONG bufferSize = sizeof(SRB_IO_CONTROL) + sizeof(FIRMWARE_REQUEST_BLOCK) + sizeof(STORAGE_FIRMWARE_ACTIVATE) + 1;
+		PUCHAR buffer = (PUCHAR)calloc(bufferSize, sizeof(UCHAR));
+		PSRB_IO_CONTROL srbControl = (PSRB_IO_CONTROL)buffer;
+		PFIRMWARE_REQUEST_BLOCK firmwareRequest = (PFIRMWARE_REQUEST_BLOCK)(srbControl + 1);
+		ULONG firmwareStructureOffset = ((sizeof(SRB_IO_CONTROL) + sizeof(FIRMWARE_REQUEST_BLOCK) - 1) / sizeof(PVOID) + 1) * sizeof(PVOID);
+		srbControl->HeaderLength = sizeof(SRB_IO_CONTROL);
+		srbControl->ControlCode = IOCTL_SCSI_MINIPORT_FIRMWARE;
+		RtlMoveMemory(srbControl->Signature, IOCTL_MINIPORT_SIGNATURE_FIRMWARE, 8);
+		srbControl->Timeout = scsiIoCtx->timeout;
+		if (srbControl->Timeout == 0)
+		{
+			srbControl->Timeout = 30;//seconds
+		}
+		srbControl->Length = bufferSize - sizeof(SRB_IO_CONTROL);
+
+		firmwareRequest->Version = FIRMWARE_REQUEST_BLOCK_STRUCTURE_VERSION;
+		firmwareRequest->Size = sizeof(FIRMWARE_REQUEST_BLOCK);
+		firmwareRequest->Function = FIRMWARE_FUNCTION_ACTIVATE;
+		if (scsiIoCtx->device->drive_info.interface_type == NVME_INTERFACE)
+		{
+			firmwareRequest->Flags = FIRMWARE_REQUEST_FLAG_CONTROLLER;
+		}
+		firmwareRequest->DataBufferOffset = firmwareStructureOffset;
+		firmwareRequest->DataBufferLength = bufferSize - firmwareStructureOffset;
+
+		PSTORAGE_FIRMWARE_ACTIVATE firmwareActivate = (PSTORAGE_FIRMWARE_ACTIVATE)((PUCHAR)srbControl + firmwareRequest->DataBufferOffset);
+		firmwareActivate->Version = STORAGE_FIRMWARE_ACTIVATE_STRUCTURE_VERSION;
+		firmwareActivate->Size = sizeof(STORAGE_FIRMWARE_ACTIVATE);
+		if (scsiIoCtx && !scsiIoCtx->pAtaCmdOpts)
+		{
+			firmwareActivate->SlotToActivate = (UCHAR)scsiIoCtx->cdb[2];//Set the slot number to the buffer ID number...This is the closest this translates.
+		}
+		if (scsiIoCtx->device->os_info.fwdlIOsupport.activateExistingCode)
+		{
+			firmwareRequest->Flags |= FIRMWARE_REQUEST_FLAG_SWITCH_TO_EXISTING_FIRMWARE;
+		}
+		
+		DWORD returned_data = 0;
+		SetLastError(ERROR_SUCCESS);//clear any cached errors before we try to send the command
+		seatimer_t commandTimer;
+		memset(&commandTimer, 0, sizeof(seatimer_t));
+		OVERLAPPED overlappedStruct;
+		memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
+		overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+		start_Timer(&commandTimer);
+		int fwdlIO = DeviceIoControl(scsiIoCtx->device->os_info.fd,
+			IOCTL_SCSI_MINIPORT,
+			buffer,
+			bufferSize,
+			buffer,
+			bufferSize,
+			&returned_data,
+			&overlappedStruct
+		);
+		scsiIoCtx->device->os_info.last_error = GetLastError();
+		if (ERROR_IO_PENDING == scsiIoCtx->device->os_info.last_error)//This will only happen for overlapped commands. If the drive is opened without the overlapped flag, everything will work like old synchronous code.-TJE
+		{
+			fwdlIO = GetOverlappedResult(scsiIoCtx->device->os_info.fd, &overlappedStruct, &returned_data, TRUE);
+			scsiIoCtx->device->os_info.last_error = GetLastError();
+		}
+		else if (scsiIoCtx->device->os_info.last_error != ERROR_SUCCESS)
+		{
+			ret = OS_PASSTHROUGH_FAILURE;
+		}
+		stop_Timer(&commandTimer);
+		CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
+		overlappedStruct.hEvent = NULL;
+		//dummy up sense data for end result
+		if (fwdlIO)
+		{
+			ret = SUCCESS;//meaning IO was sent successfully
+			uint8_t senseKey = 0, asc = 0, ascq = 0;
+			//IO sent, need to check some return data to set the status correctly
+			if (scsiIoCtx->psense)
+			{
+				memset(scsiIoCtx->psense, 0, scsiIoCtx->senseDataSize);
+			}
+			if (scsiIoCtx->pAtaCmdOpts)
+			{
+				memset(&scsiIoCtx->pAtaCmdOpts->rtfr, 0, sizeof(ataReturnTFRs));
+			}
+			switch (srbControl->ReturnCode)
+			{
+			case FIRMWARE_STATUS_SUCCESS:
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE;
+					scsiIoCtx->pAtaCmdOpts->rtfr.secCnt = 0x02;//This is supposed to be set when the drive has applied the new code.
+				}
+				ret = SUCCESS;
+				senseKey = 0;
+				asc = 0;
+				ascq = 0;
+				break;
+			case FIRMWARE_STATUS_POWER_CYCLE_REQUIRED://SUCCESS, but how do we communicate this back up the stack?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE;
+					scsiIoCtx->pAtaCmdOpts->rtfr.secCnt = 0x03;//Means code is downloaded, but device is waiting on activation
+				}
+				ret = SUCCESS;
+				senseKey = SENSE_KEY_COMPLETED;
+				asc = 0;
+				ascq = 0x22;//deferred microcode is pending activation
+				break;
+			case FIRMWARE_STATUS_ERROR://aborted command
+			case FIRMWARE_STATUS_CONTROLLER_ERROR://same as other errors?
+			case FIRMWARE_STATUS_DEVICE_ERROR://same as error? aborted command
+			case FIRMWARE_STATUS_COMMAND_ABORT://aborted command
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_ABORT;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_ABORTED_COMMAND;
+				asc = 0;
+				ascq = 0;
+				break;
+			case FIRMWARE_STATUS_ILLEGAL_REQUEST://illegal request, invalid field in CDB?
+			case FIRMWARE_STATUS_INPUT_BUFFER_TOO_BIG://illegal request, invalid field in CDB?
+			case FIRMWARE_STATUS_OUTPUT_BUFFER_TOO_SMALL://illegal request, invalid field in CDB?
+			case FIRMWARE_STATUS_INVALID_SLOT://illegal request, invalid field in CDB?
+			case FIRMWARE_STATUS_ILLEGAL_LENGTH://invalid field in CDB???
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_ABORT;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_ILLEGAL_REQUEST;
+				asc = 0x24;
+				ascq = 0;
+				break;
+			case FIRMWARE_STATUS_INVALID_IMAGE://illegal request, invalid field in CDB? or invalid field in parameter list? - Going with parameter list error
+			case FIRMWARE_STATUS_INVALID_PARAMETER://illegal request, invalid field in parameter list
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_ABORT;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_ILLEGAL_REQUEST;
+				asc = 0x26;
+				ascq = 0;
+				break;
+			case FIRMWARE_STATUS_INTERFACE_CRC_ERROR://ATA CRC error bit
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_INTERFACE_CRC;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_ABORTED_COMMAND;
+				asc = 0x47;
+				ascq = 0x03;
+				break;
+			case FIRMWARE_STATUS_UNCORRECTABLE_DATA_ERROR://Similar to one above?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_UNCORRECTABLE_DATA;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_MEDIUM_ERROR;
+				asc = 0x11;
+				ascq = 0x00;
+				break;
+			case FIRMWARE_STATUS_MEDIA_CHANGE://legacy ATAPI bit?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_MEDIA_CHANGE;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_UNIT_ATTENTION;
+				asc = 0x28;
+				ascq = 0x00;
+				break;
+			case FIRMWARE_STATUS_MEDIA_CHANGE_REQUEST://legacy ATAPI bit?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_MEDIA_CHANGE_REQUEST;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_UNIT_ATTENTION;
+				asc = 0x5A;
+				ascq = 0x01;
+				break;
+			case FIRMWARE_STATUS_ID_NOT_FOUND://ID not found ATA bit or equivalent SCSI bit?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_ID_NOT_FOUND;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_ILLEGAL_REQUEST;
+				asc = 0x21;
+				ascq = 0x00;
+				break;
+			case FIRMWARE_STATUS_END_OF_MEDIA://end of media bit?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_END_OF_MEDIA;
+				}
+				ret = SUCCESS;//command sent successfully
+				//guessing on these since I don't have a good translation
+				senseKey = SENSE_KEY_ILLEGAL_REQUEST;
+				asc = 0x3B;
+				ascq = 0x0F;
+				break;
+			default:
+				ret = OS_PASSTHROUGH_FAILURE;
+				break;
+			}
+			if (ret != OS_PASSTHROUGH_FAILURE)
+			{
+				if (senseKey != SENSE_KEY_NO_ERROR && scsiIoCtx->psense)
+				{
+					//dummy up sense data
+					//set format to 70 or 72
+					scsiIoCtx->psense[0] = SCSI_SENSE_CUR_INFO_DESC;
+					//set sense key
+					scsiIoCtx->psense[1] = senseKey;
+					//set asc
+					scsiIoCtx->psense[2] = asc;
+					//set ascq
+					scsiIoCtx->psense[3] = ascq;
+					//set additional length
+					scsiIoCtx->psense[7] = 0;//sense data only. Will adjust if including any additional ATA information
+					//set ata pt info if it was an ATA request
+					if (scsiIoCtx->pAtaCmdOpts && scsiIoCtx->senseDataSize >= 22)
+					{
+						//use RTFRs set above!
+						scsiIoCtx->psense[7] = 14;//setting to proper length for passthrough information descriptor
+						scsiIoCtx->psense[8] = 0x09;
+						scsiIoCtx->psense[9] = 0x0C;
+						scsiIoCtx->psense[11] = scsiIoCtx->pAtaCmdOpts->rtfr.error;
+						scsiIoCtx->psense[12] = scsiIoCtx->pAtaCmdOpts->rtfr.secCntExt;
+						scsiIoCtx->psense[13] = scsiIoCtx->pAtaCmdOpts->rtfr.secCnt;
+						scsiIoCtx->psense[14] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaLowExt;
+						scsiIoCtx->psense[15] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaLow;
+						scsiIoCtx->psense[16] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaMidExt;
+						scsiIoCtx->psense[17] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaMid;
+						scsiIoCtx->psense[18] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaHiExt;
+						scsiIoCtx->psense[19] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaHi;
+						scsiIoCtx->psense[20] = scsiIoCtx->pAtaCmdOpts->rtfr.device;
+						scsiIoCtx->psense[21] = scsiIoCtx->pAtaCmdOpts->rtfr.status;
+					}
+				}
+			}
+		}
+		else
+		{
+			switch (scsiIoCtx->device->os_info.last_error)
+			{
+			case ERROR_IO_DEVICE://aborted command is the best we can do
+				memset(scsiIoCtx->psense, 0, scsiIoCtx->senseDataSize);
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					memset(&scsiIoCtx->pAtaCmdOpts->rtfr, 0, sizeof(ataReturnTFRs));
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_ABORT;
+					//we need to also set sense data that matches...
+					if (scsiIoCtx->senseDataSize >= 22)//check that the sense data buffer is big enough to fill in our rtfrs using descriptor format
+					{
+						scsiIoCtx->returnStatus.format = SCSI_SENSE_CUR_INFO_DESC;
+						scsiIoCtx->returnStatus.senseKey = 0x01;//check condition
+																//setting ASC/ASCQ to ATA Passthrough Information Available
+						scsiIoCtx->returnStatus.acq = 0x00;
+						scsiIoCtx->returnStatus.ascq = 0x1D;
+						//now fill in the sens buffer
+						scsiIoCtx->psense[0] = SCSI_SENSE_CUR_INFO_DESC;
+						scsiIoCtx->psense[1] = 0x01;//recovered error
+													//setting ASC/ASCQ to ATA Passthrough Information Available
+						scsiIoCtx->psense[2] = 0x00;//ASC
+						scsiIoCtx->psense[3] = 0x1D;//ASCQ
+						scsiIoCtx->psense[4] = 0;
+						scsiIoCtx->psense[5] = 0;
+						scsiIoCtx->psense[6] = 0;
+						scsiIoCtx->psense[7] = 0x0E;//additional sense length
+						scsiIoCtx->psense[8] = 0x09;//descriptor code
+						scsiIoCtx->psense[9] = 0x0C;//additional descriptor length
+						scsiIoCtx->psense[10] = 0;
+						//fill in the returned 28bit registers
+						scsiIoCtx->psense[11] = scsiIoCtx->pAtaCmdOpts->rtfr.error;// Error
+						scsiIoCtx->psense[13] = scsiIoCtx->pAtaCmdOpts->rtfr.secCnt;// Sector Count
+						scsiIoCtx->psense[15] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaLow;// LBA Lo
+						scsiIoCtx->psense[17] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaMid;// LBA Mid
+						scsiIoCtx->psense[19] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaHi;// LBA Hi
+						scsiIoCtx->psense[20] = scsiIoCtx->pAtaCmdOpts->rtfr.device;// Device/Head
+						scsiIoCtx->psense[21] = scsiIoCtx->pAtaCmdOpts->rtfr.status;// Status
+					}
+				}
+				else
+				{
+					//setting descriptor format...
+					scsiIoCtx->psense[0] = SCSI_SENSE_CUR_INFO_DESC;
+					scsiIoCtx->psense[1] = SENSE_KEY_ABORTED_COMMAND;
+					scsiIoCtx->psense[7] = 0;
+				}
+				break;
+			default:
+				ret = OS_PASSTHROUGH_FAILURE;
+				break;
+			}
+		}
+		safe_Free(buffer);
+	}
+	else
+	{
+		uint32_t dataLength = 0;
+		if (scsiIoCtx->pAtaCmdOpts)
+		{
+			dataLength = scsiIoCtx->pAtaCmdOpts->dataSize;
+		}
+		else
+		{
+			dataLength = scsiIoCtx->dataLength;
+		}
+		ULONG bufferSize = sizeof(SRB_IO_CONTROL) + sizeof(FIRMWARE_REQUEST_BLOCK) + sizeof(STORAGE_FIRMWARE_ACTIVATE) + 1 + dataLength;
+		PUCHAR buffer = (PUCHAR)calloc(bufferSize, sizeof(UCHAR));
+		PSRB_IO_CONTROL srbControl = (PSRB_IO_CONTROL)buffer;
+		PFIRMWARE_REQUEST_BLOCK firmwareRequest = (PFIRMWARE_REQUEST_BLOCK)(srbControl + 1);
+		ULONG firmwareStructureOffset = ((sizeof(SRB_IO_CONTROL) + sizeof(FIRMWARE_REQUEST_BLOCK) - 1) / sizeof(PVOID) + 1) * sizeof(PVOID);
+		srbControl->HeaderLength = sizeof(SRB_IO_CONTROL);
+		srbControl->ControlCode = IOCTL_SCSI_MINIPORT_FIRMWARE;
+		RtlMoveMemory(srbControl->Signature, IOCTL_MINIPORT_SIGNATURE_FIRMWARE, 8);
+		srbControl->Timeout = scsiIoCtx->timeout;
+		if (srbControl->Timeout == 0)
+		{
+			srbControl->Timeout = 30;//seconds
+		}
+		srbControl->Length = bufferSize - sizeof(SRB_IO_CONTROL);
+
+		firmwareRequest->Version = FIRMWARE_REQUEST_BLOCK_STRUCTURE_VERSION;
+		firmwareRequest->Size = sizeof(FIRMWARE_REQUEST_BLOCK);
+		firmwareRequest->Function = FIRMWARE_FUNCTION_ACTIVATE;
+		if (scsiIoCtx->device->drive_info.interface_type == NVME_INTERFACE)
+		{
+			firmwareRequest->Flags = FIRMWARE_REQUEST_FLAG_CONTROLLER;
+		}
+#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_16299
+		if (scsiIoCtx->device->os_info.fwdlIOsupport.isFirstSegmentOfDownload)
+		{
+			firmwareRequest->Flags |= FIRMWARE_REQUEST_FLAG_FIRST_SEGMENT;
+		}
+#endif
+#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_15063
+		if (scsiIoCtx->device->os_info.fwdlIOsupport.isLastSegmentOfDownload)
+		{
+			//This IS documented on MSDN but VS2015 can't seem to find it...
+			//One website says that this flag is new in Win10 1704 - creators update (10.0.15021)
+			firmwareRequest->Flags |= FIRMWARE_REQUEST_FLAG_LAST_SEGMENT;
+		}
+#endif
+		firmwareRequest->DataBufferOffset = firmwareStructureOffset;
+		firmwareRequest->DataBufferLength = bufferSize - firmwareStructureOffset;
+
+		PSTORAGE_FIRMWARE_DOWNLOAD firmwareDownload = (PSTORAGE_FIRMWARE_DOWNLOAD)((PUCHAR)srbControl + firmwareRequest->DataBufferOffset);
+		firmwareDownload->Version = STORAGE_FIRMWARE_DOWNLOAD_STRUCTURE_VERSION;
+		firmwareDownload->Size = sizeof(STORAGE_FIRMWARE_DOWNLOAD);
+		firmwareDownload->BufferSize = dataLength;
+		if (scsiIoCtx && scsiIoCtx->pAtaCmdOpts)
+		{
+			//get offset from the tfrs
+			firmwareDownload->Offset = M_BytesTo2ByteValue(scsiIoCtx->pAtaCmdOpts->tfr.LbaHi, scsiIoCtx->pAtaCmdOpts->tfr.LbaMid) * LEGACY_DRIVE_SEC_SIZE;
+		}
+		else if (scsiIoCtx)
+		{
+			//get offset from the cdb
+			firmwareDownload->Offset = M_BytesTo4ByteValue(0, scsiIoCtx->cdb[3], scsiIoCtx->cdb[4], scsiIoCtx->cdb[5]);
+		}
+		else
+		{
+			safe_Free(buffer);
+			return BAD_PARAMETER;
+		}
+		//now copy the buffer into this IOCTL struct
+		memcpy(firmwareDownload->ImageBuffer, scsiIoCtx->pdata, dataLength);
+
+		//time to issue the IO
+		DWORD returned_data = 0;
+		SetLastError(ERROR_SUCCESS);//clear any cached errors before we try to send the command
+		seatimer_t commandTimer;
+		memset(&commandTimer, 0, sizeof(seatimer_t));
+		OVERLAPPED overlappedStruct;
+		memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
+		overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+		start_Timer(&commandTimer);
+		int fwdlIO = DeviceIoControl(scsiIoCtx->device->os_info.fd,
+			IOCTL_SCSI_MINIPORT,
+			buffer,
+			bufferSize,
+			buffer,
+			bufferSize,
+			&returned_data,
+			&overlappedStruct
+		);
+		scsiIoCtx->device->os_info.last_error = GetLastError();
+		if (ERROR_IO_PENDING == scsiIoCtx->device->os_info.last_error)//This will only happen for overlapped commands. If the drive is opened without the overlapped flag, everything will work like old synchronous code.-TJE
+		{
+			fwdlIO = GetOverlappedResult(scsiIoCtx->device->os_info.fd, &overlappedStruct, &returned_data, TRUE);
+			scsiIoCtx->device->os_info.last_error = GetLastError();
+		}
+		else if (scsiIoCtx->device->os_info.last_error != ERROR_SUCCESS)
+		{
+			ret = OS_PASSTHROUGH_FAILURE;
+		}
+		stop_Timer(&commandTimer);
+		CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
+		overlappedStruct.hEvent = NULL;
+		//dummy up sense data for end result
+		if (fwdlIO)
+		{
+			ret = SUCCESS;//meaning IO was sent successfully
+			uint8_t senseKey = 0, asc = 0, ascq = 0;
+			//IO sent, need to check some return data to set the status correctly
+			if (scsiIoCtx->psense)
+			{
+				memset(scsiIoCtx->psense, 0, scsiIoCtx->senseDataSize);
+			}
+			if (scsiIoCtx->pAtaCmdOpts)
+			{
+				memset(&scsiIoCtx->pAtaCmdOpts->rtfr, 0, sizeof(ataReturnTFRs));
+			}
+			switch (srbControl->ReturnCode)
+			{
+			case FIRMWARE_STATUS_SUCCESS:
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE;
+					scsiIoCtx->pAtaCmdOpts->rtfr.secCnt = 0x02;//This is supposed to be set when the drive has applied the new code.
+				}
+				ret = SUCCESS;
+				senseKey = 0;
+				asc = 0;
+				ascq = 0;
+				break;
+			case FIRMWARE_STATUS_POWER_CYCLE_REQUIRED://SUCCESS, but how do we communicate this back up the stack?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE;
+					scsiIoCtx->pAtaCmdOpts->rtfr.secCnt = 0x03;//Means code is downloaded, but device is waiting on activation
+				}
+				ret = SUCCESS;
+				senseKey = SENSE_KEY_COMPLETED;
+				asc = 0;
+				ascq = 0x22;//deferred microcode is pending activation
+				break;
+			case FIRMWARE_STATUS_ERROR://aborted command
+			case FIRMWARE_STATUS_CONTROLLER_ERROR://same as other errors?
+			case FIRMWARE_STATUS_DEVICE_ERROR://same as error? aborted command
+			case FIRMWARE_STATUS_COMMAND_ABORT://aborted command
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_ABORT;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_ABORTED_COMMAND;
+				asc = 0;
+				ascq = 0;
+				break;
+			case FIRMWARE_STATUS_ILLEGAL_REQUEST://illegal request, invalid field in CDB?
+			case FIRMWARE_STATUS_INPUT_BUFFER_TOO_BIG://illegal request, invalid field in CDB?
+			case FIRMWARE_STATUS_OUTPUT_BUFFER_TOO_SMALL://illegal request, invalid field in CDB?
+			case FIRMWARE_STATUS_INVALID_SLOT://illegal request, invalid field in CDB?
+			case FIRMWARE_STATUS_ILLEGAL_LENGTH://invalid field in CDB???
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_ABORT;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_ILLEGAL_REQUEST;
+				asc = 0x24;
+				ascq = 0;
+				break;
+			case FIRMWARE_STATUS_INVALID_IMAGE://illegal request, invalid field in CDB? or invalid field in parameter list? - Going with parameter list error
+			case FIRMWARE_STATUS_INVALID_PARAMETER://illegal request, invalid field in parameter list
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_ABORT;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_ILLEGAL_REQUEST;
+				asc = 0x26;
+				ascq = 0;
+				break;
+			case FIRMWARE_STATUS_INTERFACE_CRC_ERROR://ATA CRC error bit
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_INTERFACE_CRC;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_ABORTED_COMMAND;
+				asc = 0x47;
+				ascq = 0x03;
+				break;
+			case FIRMWARE_STATUS_UNCORRECTABLE_DATA_ERROR://Similar to one above?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_UNCORRECTABLE_DATA;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_MEDIUM_ERROR;
+				asc = 0x11;
+				ascq = 0x00;
+				break;
+			case FIRMWARE_STATUS_MEDIA_CHANGE://legacy ATAPI bit?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_MEDIA_CHANGE;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_UNIT_ATTENTION;
+				asc = 0x28;
+				ascq = 0x00;
+				break;
+			case FIRMWARE_STATUS_MEDIA_CHANGE_REQUEST://legacy ATAPI bit?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_MEDIA_CHANGE_REQUEST;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_UNIT_ATTENTION;
+				asc = 0x5A;
+				ascq = 0x01;
+				break;
+			case FIRMWARE_STATUS_ID_NOT_FOUND://ID not found ATA bit or equivalent SCSI bit?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_ID_NOT_FOUND;
+				}
+				ret = SUCCESS;//command sent successfully
+				senseKey = SENSE_KEY_ILLEGAL_REQUEST;
+				asc = 0x21;
+				ascq = 0x00;
+				break;
+			case FIRMWARE_STATUS_END_OF_MEDIA://end of media bit?
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_END_OF_MEDIA;
+				}
+				ret = SUCCESS;//command sent successfully
+							  //guessing on these since I don't have a good translation
+				senseKey = SENSE_KEY_ILLEGAL_REQUEST;
+				asc = 0x3B;
+				ascq = 0x0F;
+				break;
+			default:
+				ret = OS_PASSTHROUGH_FAILURE;
+				break;
+			}
+			if (ret != OS_PASSTHROUGH_FAILURE)
+			{
+				if (senseKey != SENSE_KEY_NO_ERROR && scsiIoCtx->psense)
+				{
+					//dummy up sense data
+					//set format to 70 or 72
+					scsiIoCtx->psense[0] = SCSI_SENSE_CUR_INFO_DESC;
+					//set sense key
+					scsiIoCtx->psense[1] = senseKey;
+					//set asc
+					scsiIoCtx->psense[2] = asc;
+					//set ascq
+					scsiIoCtx->psense[3] = ascq;
+					//set additional length
+					scsiIoCtx->psense[7] = 0;//sense data only. Will adjust if including any additional ATA information
+											 //set ata pt info if it was an ATA request
+					if (scsiIoCtx->pAtaCmdOpts && scsiIoCtx->senseDataSize >= 22)
+					{
+						//use RTFRs set above!
+						scsiIoCtx->psense[7] = 14;//setting to proper length for passthrough information descriptor
+						scsiIoCtx->psense[8] = 0x09;
+						scsiIoCtx->psense[9] = 0x0C;
+						scsiIoCtx->psense[11] = scsiIoCtx->pAtaCmdOpts->rtfr.error;
+						scsiIoCtx->psense[12] = scsiIoCtx->pAtaCmdOpts->rtfr.secCntExt;
+						scsiIoCtx->psense[13] = scsiIoCtx->pAtaCmdOpts->rtfr.secCnt;
+						scsiIoCtx->psense[14] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaLowExt;
+						scsiIoCtx->psense[15] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaLow;
+						scsiIoCtx->psense[16] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaMidExt;
+						scsiIoCtx->psense[17] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaMid;
+						scsiIoCtx->psense[18] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaHiExt;
+						scsiIoCtx->psense[19] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaHi;
+						scsiIoCtx->psense[20] = scsiIoCtx->pAtaCmdOpts->rtfr.device;
+						scsiIoCtx->psense[21] = scsiIoCtx->pAtaCmdOpts->rtfr.status;
+					}
+				}
+			}
+		}
+		else
+		{
+			switch (scsiIoCtx->device->os_info.last_error)
+			{
+			case ERROR_IO_DEVICE://aborted command is the best we can do
+				memset(scsiIoCtx->psense, 0, scsiIoCtx->senseDataSize);
+				if (scsiIoCtx->pAtaCmdOpts)
+				{
+					memset(&scsiIoCtx->pAtaCmdOpts->rtfr, 0, sizeof(ataReturnTFRs));
+					scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_ERROR;
+					scsiIoCtx->pAtaCmdOpts->rtfr.error = ATA_ERROR_BIT_ABORT;
+					//we need to also set sense data that matches...
+					if (scsiIoCtx->senseDataSize >= 22)//check that the sense data buffer is big enough to fill in our rtfrs using descriptor format
+					{
+						scsiIoCtx->returnStatus.format = SCSI_SENSE_CUR_INFO_DESC;
+						scsiIoCtx->returnStatus.senseKey = 0x01;//check condition
+																//setting ASC/ASCQ to ATA Passthrough Information Available
+						scsiIoCtx->returnStatus.acq = 0x00;
+						scsiIoCtx->returnStatus.ascq = 0x1D;
+						//now fill in the sens buffer
+						scsiIoCtx->psense[0] = SCSI_SENSE_CUR_INFO_DESC;
+						scsiIoCtx->psense[1] = 0x01;//recovered error
+													//setting ASC/ASCQ to ATA Passthrough Information Available
+						scsiIoCtx->psense[2] = 0x00;//ASC
+						scsiIoCtx->psense[3] = 0x1D;//ASCQ
+						scsiIoCtx->psense[4] = 0;
+						scsiIoCtx->psense[5] = 0;
+						scsiIoCtx->psense[6] = 0;
+						scsiIoCtx->psense[7] = 0x0E;//additional sense length
+						scsiIoCtx->psense[8] = 0x09;//descriptor code
+						scsiIoCtx->psense[9] = 0x0C;//additional descriptor length
+						scsiIoCtx->psense[10] = 0;
+						//fill in the returned 28bit registers
+						scsiIoCtx->psense[11] = scsiIoCtx->pAtaCmdOpts->rtfr.error;// Error
+						scsiIoCtx->psense[13] = scsiIoCtx->pAtaCmdOpts->rtfr.secCnt;// Sector Count
+						scsiIoCtx->psense[15] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaLow;// LBA Lo
+						scsiIoCtx->psense[17] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaMid;// LBA Mid
+						scsiIoCtx->psense[19] = scsiIoCtx->pAtaCmdOpts->rtfr.lbaHi;// LBA Hi
+						scsiIoCtx->psense[20] = scsiIoCtx->pAtaCmdOpts->rtfr.device;// Device/Head
+						scsiIoCtx->psense[21] = scsiIoCtx->pAtaCmdOpts->rtfr.status;// Status
+					}
+				}
+				else
+				{
+					//setting fixed format...
+					scsiIoCtx->psense[0] = SCSI_SENSE_CUR_INFO_DESC;
+					scsiIoCtx->psense[1] = SENSE_KEY_ABORTED_COMMAND;
+					scsiIoCtx->psense[7] = 0;
+				}
+				break;
+			default:
+				ret = OS_PASSTHROUGH_FAILURE;
+				break;
+			}
+		}
+		safe_Free(buffer);
+	}
+	return ret;
 }
 #endif
 
