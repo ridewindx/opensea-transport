@@ -791,9 +791,9 @@ int fill_In_ATA_Drive_Info(tDevice *device)
     }
     if (retrievedIdentifyData)
     {
-        if (device->drive_info.interface_type == IDE_INTERFACE && device->drive_info.scsiVersion == 0)
+        if (device->drive_info.interface_type == IDE_INTERFACE && device->drive_info.scsiVersion == SCSI_VERSION_NO_STANDARD)
         {
-            device->drive_info.scsiVersion = 0x07;//SPC5. This is what software translator will set at the moment. Can make this configurable later, but this should be ok
+            device->drive_info.scsiVersion = SCSI_VERSION_SPC_5;//SPC5. This is what software translator will set at the moment. Can make this configurable later, but this should be ok
         }
         //print_Data_Buffer((uint8_t*)ident_word, 512, true);
         ret = SUCCESS;
@@ -998,22 +998,25 @@ int fill_In_ATA_Drive_Info(tDevice *device)
             device->drive_info.ata_Options.downloadMicrocodeDMASupported = true;
         }
         //set zoned device type
-        switch (ident_word[69] & (BIT0 | BIT1))
+        if (device->drive_info.zonedType != ZONED_TYPE_HOST_MANAGED)
         {
-        case 0:
-            device->drive_info.zonedType = ZONED_TYPE_NOT_ZONED;
-            break;
-        case 1:
-            device->drive_info.zonedType = ZONED_TYPE_HOST_AWARE;
-            break;
-        case 2:
-            device->drive_info.zonedType = ZONED_TYPE_DEVICE_MANAGED;
-            break;
-        case 3:
-            device->drive_info.zonedType = ZONED_TYPE_RESERVED;
-            break;
-        default:
-            break;
+            switch (ident_word[69] & (BIT0 | BIT1))
+            {
+            case 0:
+                device->drive_info.zonedType = ZONED_TYPE_NOT_ZONED;
+                break;
+            case 1:
+                device->drive_info.zonedType = ZONED_TYPE_HOST_AWARE;
+                break;
+            case 2:
+                device->drive_info.zonedType = ZONED_TYPE_DEVICE_MANAGED;
+                break;
+            case 3:
+                device->drive_info.zonedType = ZONED_TYPE_RESERVED;
+                break;
+            default:
+                break;
+            }
         }
         //Determine if read/write log ext DMA commands are supported
         if (ident_word[119] & BIT3 || ident_word[120] & BIT3)
@@ -1110,9 +1113,9 @@ int fill_In_ATA_Drive_Info(tDevice *device)
     {
 #ifdef _DEBUG
         printf("Quiting device discovery early for %s per DO_NOT_WAKE_DRIVE\n", device->drive_info.serialNumber);
-    	printf("Drive type: %d\n",device->drive_info.drive_type);
-    	printf("Interface type: %d\n",device->drive_info.interface_type);
-    	printf("Media type: %d\n",device->drive_info.media_type);
+        printf("Drive type: %d\n",device->drive_info.drive_type);
+        printf("Interface type: %d\n",device->drive_info.interface_type);
+        printf("Media type: %d\n",device->drive_info.media_type);
         printf("SN: %s\n",device->drive_info.serialNumber);
         printf("%s <--\n",__FUNCTION__);
 #endif
@@ -1188,7 +1191,7 @@ int fill_In_ATA_Drive_Info(tDevice *device)
                     {
                         //data is valid, so figure out supported pages
                         uint8_t listLen = logBuffer[8];
-                        for (uint8_t iter = 9; iter < (listLen + 8) && iter < 512; ++iter)
+                        for (uint16_t iter = 9; iter < (uint16_t)(listLen + 8) && iter < UINT16_C(512); ++iter)
                         {
                             switch (logBuffer[iter])
                             {
@@ -1228,22 +1231,36 @@ int fill_In_ATA_Drive_Info(tDevice *device)
                     uint64_t qword0 = M_BytesTo8ByteValue(logBuffer[7], logBuffer[6], logBuffer[5], logBuffer[4], logBuffer[3], logBuffer[2], logBuffer[1], logBuffer[0]);
                     if (qword0 & BIT63 && M_Byte2(qword0) == ATA_ID_DATA_LOG_SUPPORTED_CAPABILITIES && M_Word0(qword0) >= 0x0001)
                     {
-						uint64_t supportedCapabilities = M_BytesTo8ByteValue(logBuffer[15], logBuffer[14], logBuffer[13], logBuffer[12], logBuffer[11], logBuffer[10], logBuffer[9], logBuffer[8]);
-						if (supportedCapabilities & BIT63)
-						{
-							if (supportedCapabilities & BIT50)
-							{
-								device->drive_info.softSATFlags.dataSetManagementXLSupported = true;
-							}
-							if (supportedCapabilities & BIT48)
-							{
-								device->drive_info.softSATFlags.zeroExtSupported = true;
-							}
-						}
+                        uint64_t supportedCapabilities = M_BytesTo8ByteValue(logBuffer[15], logBuffer[14], logBuffer[13], logBuffer[12], logBuffer[11], logBuffer[10], logBuffer[9], logBuffer[8]);
+                        if (supportedCapabilities & BIT63)
+                        {
+                            if (supportedCapabilities & BIT50)
+                            {
+                                device->drive_info.softSATFlags.dataSetManagementXLSupported = true;
+                            }
+                            if (supportedCapabilities & BIT48)
+                            {
+                                device->drive_info.softSATFlags.zeroExtSupported = true;
+                            }
+                        }
                         uint64_t downloadCapabilities = M_BytesTo8ByteValue(logBuffer[23], logBuffer[22], logBuffer[21], logBuffer[20], logBuffer[19], logBuffer[18], logBuffer[17], logBuffer[16]);
                         if (downloadCapabilities & BIT63 && downloadCapabilities & BIT34)
                         {
                             device->drive_info.softSATFlags.deferredDownloadSupported = true;
+                        }
+                        uint64_t supportedZACCapabilities = M_BytesTo8ByteValue(logBuffer[119], logBuffer[118], logBuffer[117], logBuffer[116], logBuffer[115], logBuffer[114], logBuffer[113], logBuffer[112]);
+                        if (supportedZACCapabilities & BIT63)//qword valid
+                        {
+                            //check if any of the ZAC commands are supported.
+                            if (supportedZACCapabilities & BIT0 || supportedZACCapabilities & BIT1 || supportedZACCapabilities & BIT2 || supportedZACCapabilities & BIT3 || supportedZACCapabilities & BIT4)
+                            {
+                                //according to what I can find in the spec, a HOST Managed drive reports a different signature, but doens't set any identify bytes like a host aware drive.
+                                //because of this and not being able to get the real signature, this check is the only way to determine we are talking to an ATA host managed drive. - TJE
+                                if (device->drive_info.zonedType == ZONED_TYPE_NOT_ZONED)
+                                {
+                                    device->drive_info.zonedType = ZONED_TYPE_HOST_MANAGED;
+                                }
+                            }
                         }
                     }
                 }
@@ -1321,9 +1338,9 @@ int fill_In_ATA_Drive_Info(tDevice *device)
     }
     device->drive_info.dataTransferSize = LEGACY_DRIVE_SEC_SIZE;
 #ifdef _DEBUG
-	printf("Drive type: %d\n",device->drive_info.drive_type);
-	printf("Interface type: %d\n",device->drive_info.interface_type);
-	printf("Media type: %d\n",device->drive_info.media_type);
+    printf("Drive type: %d\n",device->drive_info.drive_type);
+    printf("Interface type: %d\n",device->drive_info.interface_type);
+    printf("Media type: %d\n",device->drive_info.media_type);
     printf("SN: %s\n",device->drive_info.serialNumber);
     printf("%s <--\n",__FUNCTION__);
 #endif
