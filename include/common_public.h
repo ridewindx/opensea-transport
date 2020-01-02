@@ -1048,9 +1048,9 @@ extern "C"
     #endif
     typedef struct _tDevice
     {
+        driveInfo           drive_info;
         versionBlock        sanity;
         OSDriveInfo         os_info;
-        driveInfo           drive_info;
         void                *raid_device;
         issue_io_func       issue_io;
         eDiscoveryOptions   dFlags;
